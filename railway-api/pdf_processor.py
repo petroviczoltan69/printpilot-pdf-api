@@ -10,12 +10,13 @@ import fitz  # PyMuPDF
 import json
 
 def find_ocg_by_name(doc, name):
-    """Find an OCG (Optional Content Group) by name"""
+    """Find an OCG (Optional Content Group) by name, return first match"""
     try:
         oc_info = doc.get_ocgs()
         if oc_info:
             for xref, ocg in oc_info.items():
-                if ocg.get('name', '').upper() == name.upper():
+                ocg_name = ocg.get('name', '').upper()
+                if name.upper() in ocg_name or ocg_name in name.upper():
                     return xref
     except Exception as e:
         print(f"Error finding OCG: {e}", file=sys.stderr)
@@ -28,7 +29,7 @@ def list_ocgs(doc):
         if oc_info:
             print(f"Found {len(oc_info)} OCG(s):", file=sys.stderr)
             for xref, ocg in oc_info.items():
-                print(f"  xref={xref}: {ocg}", file=sys.stderr)
+                print(f"  xref={xref}: {ocg.get('name', 'unnamed')}", file=sys.stderr)
             return oc_info
         else:
             print("No OCGs found in document", file=sys.stderr)
@@ -39,12 +40,6 @@ def list_ocgs(doc):
 def process_pdf(template_path, artwork_path, output_path, layer_name="ARTWORK HERE"):
     """
     Insert artwork image into the specified layer of the template PDF
-
-    Args:
-        template_path: Path to the template PDF with layers
-        artwork_path: Path to the artwork image (PNG/JPG)
-        output_path: Path for the output PDF
-        layer_name: Name of the layer to insert artwork into
     """
     print(f"Opening template: {template_path}", file=sys.stderr)
     doc = fitz.open(template_path)
@@ -57,49 +52,58 @@ def process_pdf(template_path, artwork_path, output_path, layer_name="ARTWORK HE
     page_rect = page.rect
     print(f"Page size: {page_rect.width} x {page_rect.height} points", file=sys.stderr)
 
-    # Find the target OCG
-    target_ocg = find_ocg_by_name(doc, layer_name)
+    # Find the target OCG - "ARTWORK HERE"
+    artwork_ocg = find_ocg_by_name(doc, "ARTWORK")
+    template_ocg = find_ocg_by_name(doc, "TEMPLATE MASK")
+    background_ocg = find_ocg_by_name(doc, "BACKGROUND")
 
-    if target_ocg:
-        print(f"Found target layer '{layer_name}' with xref={target_ocg}", file=sys.stderr)
+    print(f"Found layers - ARTWORK: {artwork_ocg}, TEMPLATE: {template_ocg}, BACKGROUND: {background_ocg}", file=sys.stderr)
+
+    if artwork_ocg:
+        print(f"Using existing ARTWORK layer xref={artwork_ocg}", file=sys.stderr)
+        target_ocg = artwork_ocg
     else:
-        print(f"Layer '{layer_name}' not found. Creating new OCG...", file=sys.stderr)
-        # Create new OCG for artwork
+        print(f"ARTWORK layer not found, creating new one", file=sys.stderr)
         target_ocg = doc.add_ocg(layer_name, on=True, intent="Design", usage="Artwork")
-        print(f"Created new OCG with xref={target_ocg}", file=sys.stderr)
 
-    # Insert the artwork image
+    # Insert the artwork image with OCG association
     print(f"Inserting artwork: {artwork_path}", file=sys.stderr)
 
-    # Insert image covering the full page, associated with the OCG
-    # The 'oc' parameter associates the image with an Optional Content Group
     try:
-        page.insert_image(
-            page_rect,  # Full page
+        # Insert image and get its xref
+        # overlay=False puts it UNDER existing content
+        img_xref = page.insert_image(
+            page_rect,
             filename=artwork_path,
-            oc=target_ocg,  # Associate with OCG layer
-            overlay=False,  # Put UNDER existing content (False = below, True = above)
-            keep_proportion=False  # Stretch to fill
+            overlay=False,  # Below existing content
+            keep_proportion=False
         )
-        print("Artwork inserted successfully", file=sys.stderr)
+        print(f"Image inserted with xref={img_xref}", file=sys.stderr)
+
+        # Associate the image with the ARTWORK OCG layer
+        if img_xref and target_ocg:
+            doc.set_oc(img_xref, target_ocg)
+            print(f"Image associated with OCG layer xref={target_ocg}", file=sys.stderr)
+
     except Exception as e:
-        print(f"Error inserting image with OCG: {e}", file=sys.stderr)
-        # Fallback: insert without OCG
-        print("Trying without OCG association...", file=sys.stderr)
+        print(f"Error inserting image: {e}", file=sys.stderr)
+        # Try alternative method
+        print("Trying alternative insertion method...", file=sys.stderr)
         page.insert_image(
             page_rect,
             filename=artwork_path,
             overlay=False,
-            keep_proportion=False
+            keep_proportion=False,
+            oc=target_ocg  # Direct OCG parameter
         )
 
-    # List OCGs after insertion
-    print("OCGs after insertion:", file=sys.stderr)
+    # Verify OCGs after modification
+    print("\nFinal OCG structure:", file=sys.stderr)
     list_ocgs(doc)
 
-    # Save the output
+    # Save - preserve structure
     print(f"Saving to: {output_path}", file=sys.stderr)
-    doc.save(output_path, garbage=4, deflate=True)
+    doc.save(output_path, garbage=0, deflate=True, clean=False)
     doc.close()
 
     print("PDF processing complete!", file=sys.stderr)
