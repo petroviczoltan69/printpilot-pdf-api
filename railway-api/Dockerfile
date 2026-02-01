@@ -1,14 +1,19 @@
 # Use Node.js with Debian for easy Ghostscript installation
 FROM node:18-bullseye-slim
 
-# Install Ghostscript, ImageMagick, pdftk and qpdf for PDF operations
+# Install Ghostscript, ImageMagick, pdftk, qpdf and Python for PDF operations
 RUN apt-get update && apt-get install -y \
     ghostscript \
     imagemagick \
     libgs-dev \
     pdftk-java \
     qpdf \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install PyMuPDF for PDF layer manipulation
+RUN pip3 install --no-cache-dir pymupdf
 
 # Fix ImageMagick policy to allow PDF operations
 RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true

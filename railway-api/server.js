@@ -101,96 +101,55 @@ app.post('/api/merge-pdf-layers', upload.fields([
 
     console.log(`Job ${jobId}: Page dimensions: ${pageWidth} x ${pageHeight} points`);
 
-    // Step 2: Convert artwork PNG to PDF with EXACT page size matching template
-    // Using Ghostscript to ensure page dimensions are correct (ImageMagick doesn't set PDF page size properly)
-    console.log(`Job ${jobId}: Converting artwork to PDF with exact page size ${pageWidth}x${pageHeight} points`);
+    // Step 2: Use PyMuPDF (Python) to insert artwork into PDF layer
+    // This preserves the OCG (Optional Content Groups) structure
+    console.log(`Job ${jobId}: Using PyMuPDF for layer-aware PDF processing`);
 
-    const artworkPngPath = artworkPath; // Keep original PNG path
-
-    try {
-      // Use Ghostscript with explicit page size - this is the reliable way
-      const gsConvertCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-        -dFIXEDMEDIA \
-        -dDEVICEWIDTHPOINTS=${pageWidth} \
-        -dDEVICEHEIGHTPOINTS=${pageHeight} \
-        -dPDFFitPage \
-        -sOutputFile="${artworkPdfPath}" \
-        -c "<< /PageSize [${pageWidth} ${pageHeight}] >> setpagedevice" \
-        -f - << 'EOPS'
-%!PS-Adobe-3.0
-(${artworkPngPath}) (r) file
-/str 1000 string def
-{ currentfile str readhexstring }
-showpage
-EOPS`;
-
-      // Simpler approach: First convert PNG to a temp PDF, then resize with Ghostscript
-      // Step 2a: Convert PNG to PDF using ImageMagick (any size)
-      execSync(`convert "${artworkPngPath}" "${jobDir}/artwork_raw.pdf"`, { cwd: jobDir, timeout: 60000 });
-      console.log(`Job ${jobId}: Created raw artwork PDF`);
-
-      // Step 2b: Use Ghostscript to resize to exact template dimensions
-      execSync(`gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-        -dFIXEDMEDIA \
-        -dDEVICEWIDTHPOINTS=${pageWidth} \
-        -dDEVICEHEIGHTPOINTS=${pageHeight} \
-        -dPDFFitPage \
-        -dCompatibilityLevel=1.7 \
-        -sOutputFile="${artworkPdfPath}" \
-        "${jobDir}/artwork_raw.pdf"`, { cwd: jobDir, timeout: 60000 });
-      console.log(`Job ${jobId}: Resized artwork PDF to ${pageWidth}x${pageHeight} points`);
-
-    } catch (e) {
-      console.error(`Job ${jobId}: Ghostscript convert failed:`, e.message);
-      // Fallback to ImageMagick with page geometry
-      execSync(`convert "${artworkPngPath}" -resize ${Math.round(pageWidth)}x${Math.round(pageHeight)}! \
-        -density 72 -units PixelsPerInch \
-        -page ${Math.round(pageWidth)}x${Math.round(pageHeight)}+0+0 \
-        "${artworkPdfPath}"`, { cwd: jobDir, timeout: 60000 });
-    }
-
-    // Step 3: Use qpdf underlay (more reliable than pdftk for different page sizes)
-    console.log(`Job ${jobId}: Creating overlay PDF with qpdf...`);
+    const artworkPngPath = artworkPath;
 
     try {
-      // qpdf --underlay puts artwork BEHIND the template content
-      execSync(`qpdf "${templatePath}" --underlay "${artworkPdfPath}" -- "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
-      console.log(`Job ${jobId}: qpdf underlay succeeded`);
+      // Use Python script with PyMuPDF to insert artwork into the correct layer
+      const pythonScript = path.join(__dirname, 'pdf_processor.py');
+      const pythonCmd = `python3 "${pythonScript}" "${templatePath}" "${artworkPngPath}" "${outputPath}" "${layerName}"`;
 
-    } catch (qpdfError) {
-      console.log(`Job ${jobId}: qpdf failed, trying pdftk...`);
+      console.log(`Job ${jobId}: Running PyMuPDF processor...`);
+      const pythonOutput = execSync(pythonCmd, {
+        cwd: jobDir,
+        timeout: 120000,
+        encoding: 'utf8'
+      });
 
+      console.log(`Job ${jobId}: PyMuPDF output: ${pythonOutput}`);
+      console.log(`Job ${jobId}: PDF with layers created successfully`);
+
+    } catch (pythonError) {
+      console.error(`Job ${jobId}: PyMuPDF failed:`, pythonError.message);
+      console.log(`Job ${jobId}: Falling back to ImageMagick composite...`);
+
+      // Fallback to ImageMagick composite (loses layer structure but works)
       try {
-        // pdftk background - artwork goes behind template
-        execSync(`pdftk "${templatePath}" background "${artworkPdfPath}" output "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
-        console.log(`Job ${jobId}: pdftk background succeeded`);
+        const density = 150;
 
-      } catch (pdftkError) {
-        console.log(`Job ${jobId}: pdftk failed, trying ImageMagick composite...`);
+        // Rasterize template
+        execSync(`convert -density ${density} "${templatePath}[0]" -background none -flatten "${jobDir}/template_flat.png"`, { cwd: jobDir, timeout: 120000 });
 
-        try {
-          // Final method: Flatten both PDFs to images and composite
-          // This loses vector quality but guarantees single page output
-          const density = 300; // DPI for rasterization
+        // Get dimensions
+        const templateInfo = execSync(`identify -format "%wx%h" "${jobDir}/template_flat.png"`, { cwd: jobDir }).toString().trim();
 
-          execSync(`convert -density ${density} "${templatePath}[0]" "${jobDir}/template_flat.png"`, { cwd: jobDir, timeout: 120000 });
-          execSync(`convert -density ${density} "${artworkPdfPath}[0]" "${jobDir}/artwork_flat.png"`, { cwd: jobDir, timeout: 120000 });
+        // Resize artwork
+        execSync(`convert "${artworkPngPath}" -resize ${templateInfo}! "${jobDir}/artwork_resized.png"`, { cwd: jobDir, timeout: 60000 });
 
-          // Composite: artwork first (bottom), template on top
-          execSync(`convert "${jobDir}/artwork_flat.png" "${jobDir}/template_flat.png" -composite "${jobDir}/composite.png"`, { cwd: jobDir, timeout: 60000 });
+        // Composite
+        execSync(`convert "${jobDir}/artwork_resized.png" "${jobDir}/template_flat.png" -composite "${jobDir}/final_composite.png"`, { cwd: jobDir, timeout: 60000 });
 
-          // Convert back to PDF with correct dimensions
-          execSync(`convert "${jobDir}/composite.png" \
-            -density 72 -units PixelsPerInch \
-            -page ${Math.round(pageWidth)}x${Math.round(pageHeight)}+0+0 \
-            "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
-          console.log(`Job ${jobId}: ImageMagick composite succeeded`);
+        // Convert to PDF
+        execSync(`convert "${jobDir}/final_composite.png" -density ${density} -units PixelsPerInch "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
 
-        } catch (compositeError) {
-          console.error(`Job ${jobId}: All methods failed:`, compositeError.message);
-          // Last resort: just return the artwork PDF
-          fs.copyFileSync(artworkPdfPath, outputPath);
-        }
+        console.log(`Job ${jobId}: ImageMagick fallback succeeded (no layers)`);
+
+      } catch (fallbackError) {
+        console.error(`Job ${jobId}: All methods failed:`, fallbackError.message);
+        throw new Error(`PDF generation failed: ${pythonError.message}`);
       }
     }
 
