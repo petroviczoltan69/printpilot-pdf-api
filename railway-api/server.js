@@ -101,134 +101,94 @@ app.post('/api/merge-pdf-layers', upload.fields([
 
     console.log(`Job ${jobId}: Page dimensions: ${pageWidth} x ${pageHeight} points`);
 
-    // Step 2: Convert artwork PNG to PDF with exact page dimensions using ImageMagick
+    // Step 2: Convert artwork PNG to PDF with EXACT page size matching template
+    // Using Ghostscript to ensure page dimensions are correct (ImageMagick doesn't set PDF page size properly)
+    console.log(`Job ${jobId}: Converting artwork to PDF with exact page size ${pageWidth}x${pageHeight} points`);
+
+    const artworkPngPath = artworkPath; // Keep original PNG path
+
     try {
-      // Convert PNG to PDF with exact dimensions (geometry uses !)
-      execSync(`convert "${artworkPath}" -resize ${Math.round(pageWidth)}x${Math.round(pageHeight)}! -density 72 "${artworkPdfPath}"`, { cwd: jobDir });
-      console.log(`Job ${jobId}: Converted artwork to PDF using ImageMagick`);
-    } catch (e) {
-      console.log(`Job ${jobId}: ImageMagick convert failed, trying alternative...`);
-      // Alternative: use Ghostscript to create PDF from image via PostScript
-      const psImagePath = path.join(jobDir, 'image.ps');
-      const psContent = `%!PS-Adobe-3.0
-<< /PageSize [${pageWidth} ${pageHeight}] >> setpagedevice
-(${artworkPath}) (r) file /DCTDecode filter
-<< /ImageType 1
-   /Width ${Math.round(pageWidth)}
-   /Height ${Math.round(pageHeight)}
-   /BitsPerComponent 8
-   /Decode [0 1 0 1 0 1]
-   /ImageMatrix [${Math.round(pageWidth)} 0 0 ${Math.round(-pageHeight)} 0 ${Math.round(pageHeight)}]
-   /DataSource currentfile
->> image
+      // Use Ghostscript with explicit page size - this is the reliable way
+      const gsConvertCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
+        -dFIXEDMEDIA \
+        -dDEVICEWIDTHPOINTS=${pageWidth} \
+        -dDEVICEHEIGHTPOINTS=${pageHeight} \
+        -dPDFFitPage \
+        -sOutputFile="${artworkPdfPath}" \
+        -c "<< /PageSize [${pageWidth} ${pageHeight}] >> setpagedevice" \
+        -f - << 'EOPS'
+%!PS-Adobe-3.0
+(${artworkPngPath}) (r) file
+/str 1000 string def
+{ currentfile str readhexstring }
 showpage
-`;
-      fs.writeFileSync(psImagePath, psContent);
-      execSync(`gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOutputFile="${artworkPdfPath}" "${psImagePath}"`, { cwd: jobDir });
+EOPS`;
+
+      // Simpler approach: First convert PNG to a temp PDF, then resize with Ghostscript
+      // Step 2a: Convert PNG to PDF using ImageMagick (any size)
+      execSync(`convert "${artworkPngPath}" "${jobDir}/artwork_raw.pdf"`, { cwd: jobDir, timeout: 60000 });
+      console.log(`Job ${jobId}: Created raw artwork PDF`);
+
+      // Step 2b: Use Ghostscript to resize to exact template dimensions
+      execSync(`gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
+        -dFIXEDMEDIA \
+        -dDEVICEWIDTHPOINTS=${pageWidth} \
+        -dDEVICEHEIGHTPOINTS=${pageHeight} \
+        -dPDFFitPage \
+        -dCompatibilityLevel=1.7 \
+        -sOutputFile="${artworkPdfPath}" \
+        "${jobDir}/artwork_raw.pdf"`, { cwd: jobDir, timeout: 60000 });
+      console.log(`Job ${jobId}: Resized artwork PDF to ${pageWidth}x${pageHeight} points`);
+
+    } catch (e) {
+      console.error(`Job ${jobId}: Ghostscript convert failed:`, e.message);
+      // Fallback to ImageMagick with page geometry
+      execSync(`convert "${artworkPngPath}" -resize ${Math.round(pageWidth)}x${Math.round(pageHeight)}! \
+        -density 72 -units PixelsPerInch \
+        -page ${Math.round(pageWidth)}x${Math.round(pageHeight)}+0+0 \
+        "${artworkPdfPath}"`, { cwd: jobDir, timeout: 60000 });
     }
 
-    // Step 3: Overlay artwork UNDER template using Ghostscript
-    // Strategy: Create intermediate PDF with artwork, then overlay template on top
-    console.log(`Job ${jobId}: Creating overlay PDF...`);
-
-    const intermediatePath = path.join(jobDir, 'intermediate.pdf');
+    // Step 3: Use qpdf underlay (more reliable than pdftk for different page sizes)
+    console.log(`Job ${jobId}: Creating overlay PDF with qpdf...`);
 
     try {
-      // Method 1: Try pdftk background (artwork as background, template on top)
-      // pdftk template.pdf background artwork.pdf output output.pdf
-      console.log(`Job ${jobId}: Trying pdftk background...`);
-      execSync(`pdftk "${templatePath}" background "${artworkPdfPath}" output "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
-      console.log(`Job ${jobId}: pdftk background succeeded`);
+      // qpdf --underlay puts artwork BEHIND the template content
+      execSync(`qpdf "${templatePath}" --underlay "${artworkPdfPath}" -- "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
+      console.log(`Job ${jobId}: qpdf underlay succeeded`);
 
-    } catch (pdftkError) {
-      console.log(`Job ${jobId}: pdftk not available, trying qpdf...`);
+    } catch (qpdfError) {
+      console.log(`Job ${jobId}: qpdf failed, trying pdftk...`);
 
       try {
-        // Method 2: Try qpdf underlay
-        execSync(`qpdf "${templatePath}" --underlay "${artworkPdfPath}" -- "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
-        console.log(`Job ${jobId}: qpdf underlay succeeded`);
+        // pdftk background - artwork goes behind template
+        execSync(`pdftk "${templatePath}" background "${artworkPdfPath}" output "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
+        console.log(`Job ${jobId}: pdftk background succeeded`);
 
-      } catch (qpdfError) {
-        console.log(`Job ${jobId}: qpdf not available, trying Ghostscript composite...`);
+      } catch (pdftkError) {
+        console.log(`Job ${jobId}: pdftk failed, trying ImageMagick composite...`);
 
         try {
-          // Method 3: Ghostscript - process artwork first, then add template content on top
-          // Create a PostScript file that composites both PDFs on same page
-          const compositePs = path.join(jobDir, 'composite.ps');
-          const compositePsContent = `%!PS-Adobe-3.0 EPSF-3.0
-%%BoundingBox: 0 0 ${Math.round(pageWidth)} ${Math.round(pageHeight)}
-%%Pages: 1
-%%EndComments
-%%BeginProlog
-/BeginEPSF {
-  /b4_Inc_state save def
-  /dict_count countdictstack def
-  /op_count count 1 sub def
-  userdict begin
-  /showpage { } def
-  0 setgray 0 setlinecap 1 setlinewidth 0 setlinejoin
-  10 setmiterlimit [ ] 0 setdash newpath
-  /languagelevel where { pop languagelevel 1 ne { false setstrokeadjust false setoverprint } if } if
-} bind def
-/EndEPSF {
-  count op_count sub {pop} repeat
-  countdictstack dict_count sub {end} repeat
-  b4_Inc_state restore
-} bind def
-%%EndProlog
-%%Page: 1 1
-<< /PageSize [${pageWidth} ${pageHeight}] >> setpagedevice
-`;
-          fs.writeFileSync(compositePs, compositePsContent);
+          // Final method: Flatten both PDFs to images and composite
+          // This loses vector quality but guarantees single page output
+          const density = 300; // DPI for rasterization
 
-          // Process both PDFs through Ghostscript, extracting first page only
-          // First: artwork as base layer (first in command = bottom layer when using pdfwrite)
-          // Then: template on top
-          const gsCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-            -dPDFSETTINGS=/prepress \
-            -dCompatibilityLevel=1.7 \
-            -dAutoRotatePages=/None \
-            -dFirstPage=1 -dLastPage=1 \
-            -dFIXEDMEDIA \
-            -dDEVICEWIDTHPOINTS=${pageWidth} \
-            -dDEVICEHEIGHTPOINTS=${pageHeight} \
-            -sOutputFile="${intermediatePath}" \
-            "${artworkPdfPath}" 2>&1`;
+          execSync(`convert -density ${density} "${templatePath}[0]" "${jobDir}/template_flat.png"`, { cwd: jobDir, timeout: 120000 });
+          execSync(`convert -density ${density} "${artworkPdfPath}[0]" "${jobDir}/artwork_flat.png"`, { cwd: jobDir, timeout: 120000 });
 
-          execSync(gsCmd, { cwd: jobDir, timeout: 60000 });
-          console.log(`Job ${jobId}: Created artwork base layer`);
-
-          // Now overlay template on top using pdfmark /SP (showpage mark)
-          const overlayCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-            -dPDFSETTINGS=/prepress \
-            -dCompatibilityLevel=1.7 \
-            -dAutoRotatePages=/None \
-            -dFirstPage=1 -dLastPage=1 \
-            -sOutputFile="${outputPath}" \
-            "${intermediatePath}" \
-            -c "[/Page 1 /View [/XYZ 0 ${pageHeight} 1] /DEST pdfmark" \
-            -f "${templatePath}" 2>&1`;
-
-          execSync(overlayCmd, { cwd: jobDir, timeout: 60000 });
-          console.log(`Job ${jobId}: Added template overlay - but this creates 2 pages`);
-
-          // If we still have 2 pages, extract just page 1 with the artwork
-          // Since Ghostscript concatenates, let's just return the artwork PDF
-          // with correct dimensions as the final output (template mask will be lost)
-
-          // Better approach: Use convert (ImageMagick) to composite the pages
-          console.log(`Job ${jobId}: Trying ImageMagick composite...`);
-          execSync(`convert -density 300 "${artworkPdfPath}[0]" -resize ${Math.round(pageWidth)}x${Math.round(pageHeight)}! "${jobDir}/artwork_flat.png"`, { cwd: jobDir, timeout: 60000 });
-          execSync(`convert -density 300 "${templatePath}[0]" -resize ${Math.round(pageWidth)}x${Math.round(pageHeight)}! "${jobDir}/template_flat.png"`, { cwd: jobDir, timeout: 60000 });
+          // Composite: artwork first (bottom), template on top
           execSync(`convert "${jobDir}/artwork_flat.png" "${jobDir}/template_flat.png" -composite "${jobDir}/composite.png"`, { cwd: jobDir, timeout: 60000 });
-          execSync(`convert "${jobDir}/composite.png" -density 72 -units PixelsPerInch "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
+
+          // Convert back to PDF with correct dimensions
+          execSync(`convert "${jobDir}/composite.png" \
+            -density 72 -units PixelsPerInch \
+            -page ${Math.round(pageWidth)}x${Math.round(pageHeight)}+0+0 \
+            "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
           console.log(`Job ${jobId}: ImageMagick composite succeeded`);
 
-        } catch (gsError) {
-          console.error(`Job ${jobId}: All overlay methods failed:`, gsError.message);
-
-          // Final fallback: just return artwork PDF with correct dimensions
-          console.log(`Job ${jobId}: Returning artwork-only PDF`);
+        } catch (compositeError) {
+          console.error(`Job ${jobId}: All methods failed:`, compositeError.message);
+          // Last resort: just return the artwork PDF
           fs.copyFileSync(artworkPdfPath, outputPath);
         }
       }
