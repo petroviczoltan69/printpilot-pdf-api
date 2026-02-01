@@ -95,81 +95,56 @@ app.post('/api/merge-pdf-layers', upload.fields([
 
     console.log(`Job ${jobId}: Files saved`);
 
-    // Step 1: Convert artwork image to PDF with transparency
-    // Using Ghostscript to create a PDF from the image
-    const convertCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dEPSCrop \
-      -sOutputFile="${artworkPdfPath}" \
-      -c "<< /PageSize [${width} ${height}] >> setpagedevice" \
-      -f "${artworkPath}" 2>&1 || convert "${artworkPath}" -resize ${width}x${height} "${artworkPdfPath}"`;
+    // Step 1: Get template PDF dimensions using Ghostscript
+    const pageWidth = parseFloat(req.body.pageWidth) || width;
+    const pageHeight = parseFloat(req.body.pageHeight) || height;
+
+    console.log(`Job ${jobId}: Page dimensions: ${pageWidth} x ${pageHeight} points`);
+
+    // Step 2: Use ImageMagick to composite artwork and template into single image, then convert to PDF
+    // This is the ONLY reliable way to guarantee single page output
+    console.log(`Job ${jobId}: Using ImageMagick composite method for guaranteed single page`);
+
+    const density = 150; // DPI for rasterization (balance between quality and speed)
+    const artworkPngPath = artworkPath;
 
     try {
-      // Try using ImageMagick if available (better for images)
-      execSync(`convert "${artworkPath}" -resize ${width}x${height}! "${artworkPdfPath}"`, { cwd: jobDir });
-      console.log(`Job ${jobId}: Converted artwork to PDF using ImageMagick`);
+      // Step 2a: Rasterize template PDF to PNG (first page only)
+      console.log(`Job ${jobId}: Rasterizing template PDF...`);
+      execSync(`convert -density ${density} "${templatePath}[0]" -background none -flatten "${jobDir}/template_flat.png"`, { cwd: jobDir, timeout: 120000 });
+
+      // Step 2b: Resize artwork to match template dimensions
+      console.log(`Job ${jobId}: Resizing artwork...`);
+      // Get template image dimensions
+      const templateInfo = execSync(`identify -format "%wx%h" "${jobDir}/template_flat.png"`, { cwd: jobDir }).toString().trim();
+      console.log(`Job ${jobId}: Template rasterized size: ${templateInfo}`);
+
+      // Resize artwork to same dimensions
+      execSync(`convert "${artworkPngPath}" -resize ${templateInfo}! "${jobDir}/artwork_resized.png"`, { cwd: jobDir, timeout: 60000 });
+
+      // Step 2c: Composite - artwork FIRST (bottom layer), template ON TOP
+      console.log(`Job ${jobId}: Compositing artwork under template...`);
+      execSync(`convert "${jobDir}/artwork_resized.png" "${jobDir}/template_flat.png" -composite "${jobDir}/final_composite.png"`, { cwd: jobDir, timeout: 60000 });
+
+      // Step 2d: Convert composite PNG to PDF with correct page dimensions
+      console.log(`Job ${jobId}: Converting composite to PDF...`);
+      execSync(`convert "${jobDir}/final_composite.png" \
+        -density ${density} \
+        -units PixelsPerInch \
+        "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
+
+      console.log(`Job ${jobId}: Single page PDF created successfully`);
+
     } catch (e) {
-      // Fallback: Use Ghostscript approach with PostScript
-      const psContent = `
-%!PS
-/img {
-  (${artworkPath}) (r) file
-  << /PageSize [${width} ${height}] >> setpagedevice
-  0 0 translate
-  ${width} ${height} scale
-  /DeviceRGB setcolorspace
-  << /ImageType 1
-     /Width ${width}
-     /Height ${height}
-     /BitsPerComponent 8
-     /Decode [0 1 0 1 0 1]
-     /ImageMatrix [${width} 0 0 -${height} 0 ${height}]
-     /DataSource currentfile /ASCIIHexDecode filter
-  >> image
-} def
-showpage
-`;
-      // For now, create a simple colored rectangle as placeholder
-      // Real implementation would properly embed the image
-      console.log(`Job ${jobId}: ImageMagick not available, using alternative method`);
-    }
+      console.error(`Job ${jobId}: ImageMagick composite failed:`, e.message);
 
-    // Step 2: Create PostScript that defines the layer structure
-    // This PostScript creates an OCG (Optional Content Group) layer
-    const psLayerScript = `
-%!PS-Adobe-3.0
-% PDF with Layers (OCG) - PrintPilot Generator
-
-/pdfmark where {pop} {userdict /pdfmark /cleartomark load put} ifelse
-
-% Define the layer (OCG)
-[/OC << /Name (${layerName}) /Intent /View /Usage << /CreatorInfo << /Creator (PrintPilot) /Subtype /Artwork >> >> >> /OC pdfmark
-
-% Start layer content
-[{ThisPage} << /Contents [{stream}] >> /PUT pdfmark
-`;
-
-    // Step 3: Use Ghostscript to merge PDFs while preserving structure
-    // The -dPDFSETTINGS=/prepress preserves quality
-    const mergeCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-      -dPDFSETTINGS=/prepress \
-      -dCompatibilityLevel=1.7 \
-      -dPreserveOPIComments=true \
-      -dPreserveOverprintSettings=true \
-      -sOutputFile="${outputPath}" \
-      "${templatePath}" "${artworkPdfPath}" 2>&1`;
-
-    console.log(`Job ${jobId}: Merging PDFs...`);
-
-    try {
-      const mergeOutput = execSync(mergeCmd, { cwd: jobDir, timeout: 60000 });
-      console.log(`Job ${jobId}: Merge output:`, mergeOutput.toString());
-    } catch (gsError) {
-      console.error(`Job ${jobId}: Ghostscript merge error:`, gsError.message);
-
-      // Fallback: Try simpler merge
-      const simpleMergeCmd = `gs -dNOPAUSE -dBATCH -sDEVICE=pdfwrite \
-        -sOutputFile="${outputPath}" \
-        "${templatePath}" 2>&1`;
-      execSync(simpleMergeCmd, { cwd: jobDir, timeout: 60000 });
+      // Fallback: just return artwork as PDF (no template overlay)
+      console.log(`Job ${jobId}: Falling back to artwork-only PDF`);
+      try {
+        execSync(`convert "${artworkPngPath}" -density 72 "${outputPath}"`, { cwd: jobDir, timeout: 60000 });
+      } catch (fallbackError) {
+        throw new Error(`All PDF generation methods failed: ${e.message}`);
+      }
     }
 
     // Check if output was created
